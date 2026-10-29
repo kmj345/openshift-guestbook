@@ -77,6 +77,7 @@ cd openshift-guestbook/students/202155527
 
 # 다른 계정에서는 해당 계정의 OpenShift 프로젝트 이름으로 변경합니다.
 oc project kmj-redhat-dev
+
 oc apply -f k8s/
 oc rollout status deployment/guestbook-redis --timeout=300s
 oc rollout status deployment/guestbook-web --timeout=300s
