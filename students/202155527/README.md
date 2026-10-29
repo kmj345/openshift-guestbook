@@ -75,9 +75,8 @@ OpenShift에 로그인한 `oc` CLI 환경에서 실행합니다. 프로젝트에
 git clone https://github.com/kmj345/openshift-guestbook.git
 cd openshift-guestbook/students/202155527
 
-# 다른 계정에서는 해당 계정의 OpenShift 프로젝트 이름으로 변경이 필요합니다.
+# 다른 계정에서는 본인의 OpenShift 프로젝트 이름으로 변경합니다.
 oc project kmj-redhat-dev
-
 oc apply -f k8s/
 oc rollout status deployment/guestbook-redis --timeout=300s
 oc rollout status deployment/guestbook-web --timeout=300s
@@ -120,8 +119,11 @@ oc rollout status deployment/guestbook-web --timeout=300s
 | 웹 / Redis Pod | 모두 Running, Ready 1/1 |
 | PVC | guestbook-data, Bound, 1Gi |
 | Redis Pod 재생성 | 기존 글 유지 |
+| 전체 삭제 후 재배포 | YAML 9개로 재생성 및 방명록 기능 정상 동작 |
 
 데이터 보존은 확인용 글을 작성한 뒤 Redis Pod만 삭제해 검사했습니다. 새 Pod가 준비된 후 방명록을 새로고침했으며, 기존 글이 남아 있었습니다. 이때 PVC는 삭제하지 않았습니다.
+
+아래는 최초 배포와 데이터 보존 테스트 당시의 화면입니다.
 
 ![방명록 화면](images/01-guestbook.png)
 
@@ -130,6 +132,14 @@ oc rollout status deployment/guestbook-web --timeout=300s
 ![guestbook-data PVC 상태](images/03-pvc.png)
 
 ![웹과 Redis Deployment의 Topology](images/04-topology.png)
+
+### 전체 삭제 후 재배포 결과
+
+GitHub에서 받은 `k8s/`의 YAML로 기존 리소스를 PVC까지 삭제한 뒤 다시 배포했습니다. 리소스 9개가 생성되었고, 두 Pod의 `Running`, Ready `1/1` 및 새 PVC의 `Bound` 상태를 확인했습니다.
+
+새 PVC가 생성되어 방명록이 빈 상태로 시작했으며, 글 등록과 비밀번호를 이용한 삭제도 정상 동작했습니다.
+
+![전체 삭제 후 재배포 결과](images/06-redeploy.png)
 
 
 ## 6. 어려웠던 점
