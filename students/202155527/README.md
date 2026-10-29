@@ -75,7 +75,9 @@ OpenShift에 로그인한 `oc` CLI 환경에서 실행합니다. 프로젝트에
 git clone https://github.com/kmj345/openshift-guestbook.git
 cd openshift-guestbook/students/202155527
 
-oc project OpenShift_프로젝트_이름
+# 다른 계정에서는 해당 계정의 OpenShift 프로젝트 이름으로 변경이 필요합니다.
+oc project kmj-redhat-dev
+
 oc apply -f k8s/
 oc rollout status deployment/guestbook-redis --timeout=300s
 oc rollout status deployment/guestbook-web --timeout=300s
