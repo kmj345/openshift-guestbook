@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: guestbook-web
+  labels:
+    app: guestbook
+    component: web
+spec:
+  type: ClusterIP
+  selector:
+    app: guestbook
+    component: web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

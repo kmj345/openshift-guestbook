@@ -1,0 +1,405 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: guestbook-web-config
+  labels:
+    app: guestbook
+    component: web
+data:
+  APP_TITLE: OpenShift 실습용 방명록
+  REDIS_HOST: guestbook-redis
+  REDIS_PORT: '6379'
+  app.py: |
+    """OpenShift 실습용 방명록: Python 표준 라이브러리와 Redis를 사용합니다."""
+
+    import html
+    import hashlib
+    import hmac
+    import re
+    import secrets
+    import threading
+    import json
+    import os
+    import socket
+    from datetime import datetime, timedelta, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, urlsplit
+
+
+    APP_TITLE = os.environ.get("APP_TITLE", "민준의 방명록")
+    REDIS_HOST = os.environ.get("REDIS_HOST", "guestbook-redis")
+    REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
+    REDIS_PASSWORD = os.environ["REDIS_PASSWORD"]
+    PORT = int(os.environ.get("PORT", "8080"))
+    ENTRY_KEY = "guestbook:entries:v1"
+    KST = timezone(timedelta(hours=9))
+    PAGE_SIZE = 10
+    INDEX_KEY = "guestbook:entries:index:v2"
+    HASH_SLOTS = threading.BoundedSemaphore(2)
+
+
+    class RedisError(Exception):
+        pass
+
+
+    def encode_command(parts):
+        """Redis RESP2 명령을 만듭니다. 한글도 바이트 길이로 계산합니다."""
+        chunks = [f"*{len(parts)}\r\n".encode()]
+        for part in parts:
+            value = str(part).encode("utf-8")
+            chunks.extend([f"${len(value)}\r\n".encode(), value, b"\r\n"])
+        return b"".join(chunks)
+
+
+    def read_reply(stream):
+        """이 앱에서 사용하는 Redis 응답 종류를 읽습니다."""
+        line = stream.readline(65536)
+        if not line.endswith(b"\r\n"):
+            raise RedisError("Incomplete Redis reply")
+        kind, value = line[:1], line[1:-2]
+        if kind == b"+":
+            return value.decode("utf-8")
+        if kind == b"-":
+            raise RedisError(value.decode("utf-8", errors="replace"))
+        if kind == b":":
+            return int(value)
+        if kind == b"$":
+            size = int(value)
+            if size == -1:
+                return None
+            if not 0 <= size <= 1048576:
+                raise RedisError("Redis reply too large")
+            data = stream.read(size)
+            if len(data) != size or stream.read(2) != b"\r\n":
+                raise RedisError("Incomplete Redis value")
+            return data.decode("utf-8")
+        if kind == b"*":
+            size = int(value)
+            if size == -1:
+                return None
+            if not 0 <= size <= 1000:
+                raise RedisError("Redis array too large")
+            return [read_reply(stream) for _ in range(size)]
+        raise RedisError("Unsupported Redis reply")
+
+
+    def redis_commands(*commands):
+        """Secret에서 전달받은 비밀번호로 인증한 뒤 명령을 실행합니다."""
+        with socket.create_connection((REDIS_HOST, REDIS_PORT), timeout=3) as conn:
+            conn.settimeout(3)
+            with conn.makefile("rb") as stream:
+                payload = encode_command(("AUTH", REDIS_PASSWORD))
+                payload += b"".join(encode_command(command) for command in commands)
+                conn.sendall(payload)
+                if read_reply(stream) != "OK":
+                    raise RedisError("Redis authentication failed")
+                return [read_reply(stream) for _ in commands]
+
+
+    CREATE_SCRIPT = """
+    if redis.call('HEXISTS', KEYS[2], ARGV[1]) == 1 then return 0 end
+    redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+    redis.call('LPUSH', KEYS[1], ARGV[2])
+    return 1
+    """
+    DELETE_SCRIPT = """
+    if redis.call('HGET', KEYS[2], ARGV[1]) ~= ARGV[2] then return 0 end
+    local removed = redis.call('LREM', KEYS[1], 1, ARGV[2])
+    redis.call('HDEL', KEYS[2], ARGV[1])
+    redis.call('DEL', KEYS[3])
+    return removed
+    """
+    ATTEMPT_SCRIPT = """
+    local count = redis.call('INCR', KEYS[1])
+    if count == 1 then redis.call('EXPIRE', KEYS[1], 60) end
+    return count
+    """
+
+
+    def password_digest(password, salt):
+        return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), bytes.fromhex(salt), 600000).hex()
+
+
+    def encode_password(password):
+        salt = secrets.token_hex(16)
+        return 'pbkdf2_sha256$600000$' + salt + '$' + password_digest(password, salt)
+
+
+    def verify_password(password, encoded):
+        try:
+            algorithm, rounds, salt, digest = encoded.split('$')
+            if algorithm != 'pbkdf2_sha256' or rounds != '600000' or len(salt) != 32 or len(digest) != 64:
+                return False
+            return hmac.compare_digest(password_digest(password, salt), digest)
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+
+    STYLE = """
+    *{box-sizing:border-box}html{color-scheme:light}body{margin:0;background:#fff;color:#171717;
+    font-family:Arial,'Noto Sans KR','Malgun Gothic',sans-serif;-webkit-font-smoothing:antialiased}
+    a{color:inherit;text-decoration:none}button,input,textarea{font:inherit}button,a,input,textarea{-webkit-tap-highlight-color:transparent}
+    .wrap{width:min(1120px,100%);margin:0 auto;padding:66px 32px 80px}
+    .page-title{font-size:36px;font-weight:750;letter-spacing:-1.5px;line-height:1.3;margin:0 0 44px;overflow-wrap:anywhere}
+    .list-meta{display:flex;justify-content:space-between;align-items:center;margin:0 0 16px;font-size:13px;color:#666}
+    .list-meta strong{font-weight:700;color:#171717}.plain-link{border-bottom:1px solid transparent;padding:3px 0}.plain-link:hover{border-color:#171717}
+    .table-scroll{width:100%;overflow-x:auto}.board{width:100%;border-collapse:collapse;table-layout:fixed;border-top:2px solid #171717;border-bottom:1px solid #555}
+    .board col.num{width:65px}.board col.author{width:130px}.board col.date{width:165px}.board col.action{width:72px}
+    .board th{font-size:14px;font-weight:650;text-align:center;padding:19px 12px;border-bottom:1px solid #aaa}
+    .board td{font-size:14px;line-height:1.7;padding:23px 12px;text-align:center;border-bottom:1px solid #e5e5e5;vertical-align:top;overflow-wrap:anywhere}
+    .board tbody tr:last-child td{border-bottom:0}.board td.content{text-align:left;padding-left:20px;padding-right:24px;white-space:pre-wrap}
+    .board td.date-cell{font-size:12px;color:#707070;white-space:nowrap}.board td.num-cell{color:#777}.delete-link{font-size:12px;color:#666;text-decoration:underline;text-underline-offset:4px}
+    .muted{color:#aaa}.board td.empty{height:170px;vertical-align:middle;color:#777;text-align:center}
+    .pagination{display:flex;justify-content:center;align-items:center;gap:0;margin:30px 0 0}
+    .page{display:inline-flex;align-items:center;justify-content:center;min-width:36px;height:36px;padding:0 8px;border:1px solid #ddd;margin-left:-1px;font-size:13px}
+    .page.active{background:#171717;border-color:#171717;color:#fff;position:relative}.page.disabled{color:#bcbcbc}.page:not(.active):not(.disabled):hover{background:#f5f5f5}
+    .actions{display:flex;justify-content:center;gap:10px;margin-top:30px}
+    .button{display:inline-flex;align-items:center;justify-content:center;min-width:116px;min-height:44px;padding:11px 26px;border:1px solid #171717;border-radius:0;background:#171717;color:#fff;font-size:14px;cursor:pointer;line-height:1.4}
+    .button:hover{background:#333;border-color:#333}.button.secondary{background:#fff;color:#333;border-color:#ccc}.button.secondary:hover{background:#f7f7f7}
+    a:focus-visible,button:focus-visible{outline:2px solid #171717;outline-offset:4px}
+    .notice{padding:13px 16px;margin:0 0 22px;background:#f6f6f6;border:1px solid #ddd;font-size:14px;line-height:1.6}.notice.error{color:#a32929;border-color:#e5caca;background:#fffafa}
+    .form-sheet{border-top:2px solid #171717;border-bottom:1px solid #555;padding:30px 0 32px}
+    .field-grid{display:grid;grid-template-columns:1fr 1fr;gap:28px}.field{margin:0 0 28px}.field:last-child{margin-bottom:0}
+    label{display:block;font-size:14px;font-weight:650;margin-bottom:12px}.required{color:#666;font-size:12px;font-weight:400;margin-left:6px}
+    input,textarea{width:100%;border:1px solid #ccc;border-radius:0;background:#fff;color:#171717;padding:12px 14px;font-size:14px;outline:none}
+    input{height:46px}textarea{min-height:240px;line-height:1.8;resize:vertical}input:focus,textarea:focus{border-color:#171717;box-shadow:0 0 0 1px #171717}
+    input::placeholder,textarea::placeholder{color:#a0a0a0}.hint{font-size:12px;color:#777;margin:9px 0 0;line-height:1.6}
+    .delete-sheet{max-width:660px;margin:0 auto}.entry-preview{padding:24px 0;border-top:2px solid #171717;border-bottom:1px solid #ddd;margin-bottom:26px}
+    .entry-meta{display:flex;justify-content:space-between;gap:18px;align-items:baseline;font-size:14px}.entry-meta time{font-size:12px;color:#777}
+    .entry-message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:15px;line-height:1.8;margin:22px 0 0}.error-page{padding:24px 0;border-top:2px solid #171717;line-height:1.8}
+    @media(max-width:700px){.wrap{padding:36px 18px 50px}.page-title{font-size:29px;margin-bottom:30px}.board{min-width:580px}
+    .board col.num{width:45px}.board col.author{width:85px}.board col.date{width:130px}.board col.action{width:55px}
+    .board th{font-size:12px;padding:15px 8px}.board td{font-size:13px;padding:18px 8px}.board td.content{padding-left:12px;padding-right:12px}
+    .board td.date-cell{font-size:11px}.field-grid{grid-template-columns:1fr;gap:0}.field-grid .field{margin-bottom:24px}
+    .form-sheet{padding:24px 0}.entry-meta{align-items:flex-start;flex-direction:column;gap:8px}.pagination{margin-top:24px}}
+    """
+
+
+    def page_shell(title, body, notice='', error=False):
+        escape = html.escape
+        banner = f'<div class="notice{" error" if error else ""}" role="{"alert" if error else "status"}">{escape(notice)}</div>' if notice else ''
+        return f'''<!doctype html>
+    <html lang="ko"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>{escape(title)} · {escape(APP_TITLE)}</title><style>{STYLE}</style></head>
+    <body><main class="wrap"><h1 class="page-title">{escape(title)}</h1>{banner}{body}</main></body></html>'''
+
+
+    def render_list(entries, total, page=1, notice=''):
+        escape = html.escape
+        rows = []
+        for i, entry in enumerate(entries):
+            number = total - (page - 1) * PAGE_SIZE - i
+            entry_id = entry.get('id', '')
+            can_delete = re.fullmatch(r'[0-9a-f]{32}', entry_id) and bool(entry.get('password_hash'))
+            control = f'<a class="delete-link" href="/entries/{entry_id}/delete" aria-label="{number}번 글 삭제">삭제</a>' if can_delete else '<span class="muted" title="삭제 비밀번호 없이 작성된 이전 글">—</span>'
+            rows.append(f'''<tr><td class="num-cell">{number}</td><td class="content">{escape(entry['message'])}</td>
+    <td>{escape(entry['name'])}</td><td class="date-cell">{escape(entry['created_at'])}</td><td>{control}</td></tr>''')
+        listing = ''.join(rows) or '<tr><td colspan="5" class="empty">등록된 글이 없습니다.</td></tr>'
+        pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+        start = ((page - 1) // 5) * 5 + 1
+        def nav(label, dest, disabled=False):
+            return f'<span class="page disabled" aria-disabled="true">{label}</span>' if disabled else f'<a class="page" href="/?page={dest}">{label}</a>'
+        links = [nav('&laquo;', 1, page == 1), nav('&lsaquo;', max(1, page - 1), page == 1)]
+        for n in range(start, min(start + 4, pages) + 1):
+            links.append(f'<span class="page active" aria-current="page">{n}</span>' if n == page else f'<a class="page" href="/?page={n}">{n}</a>')
+        links.extend([nav('&rsaquo;', min(pages, page + 1), page == pages), nav('&raquo;', pages, page == pages)])
+        body = f'''<div class="list-meta"><span>총 <strong>{total}</strong>개</span><a class="plain-link" href="/?page={page}">새로고침</a></div>
+    <div class="table-scroll"><table class="board" aria-label="방명록 목록"><colgroup><col class="num"><col><col class="author"><col class="date"><col class="action"></colgroup>
+    <thead><tr><th scope="col">번호</th><th scope="col">내용</th><th scope="col">작성자</th><th scope="col">작성일</th><th scope="col">관리</th></tr></thead><tbody>{listing}</tbody></table></div>
+    <nav class="pagination" aria-label="페이지">{''.join(links)}</nav><div class="actions"><a class="button" href="/write">글쓰기</a></div>'''
+        return page_shell(APP_TITLE, body, notice)
+
+
+    def render_write(notice='', name='', message=''):
+        escape = html.escape
+        body = f'''<form action="/entries" method="post" accept-charset="UTF-8">
+    <div class="form-sheet"><div class="field-grid"><div class="field"><label for="name">작성자</label>
+    <input id="name" name="name" maxlength="30" required autocomplete="off" placeholder="이름" value="{escape(name)}"></div>
+    <div class="field"><label for="password">삭제 비밀번호</label><input id="password" type="password" name="password" minlength="4" maxlength="64" required autocomplete="new-password" placeholder="4~64자">
+    <p class="hint">글을 삭제할 때 필요합니다.</p></div></div><div class="field"><label for="message">내용 <span class="required">최대 500자</span></label>
+    <textarea id="message" name="message" maxlength="500" required>{escape(message)}</textarea></div></div>
+    <div class="actions"><a class="button secondary" href="/">취소</a><button class="button" type="submit">등록</button></div></form>'''
+        return page_shell('글쓰기', body, notice, bool(notice))
+
+
+    def render_delete(entry, notice=''):
+        escape = html.escape
+        entry_id = entry['id']
+        body = f'''<section class="delete-sheet"><div class="entry-preview"><div class="entry-meta"><strong>{escape(entry['name'])}</strong>
+    <time>{escape(entry['created_at'])}</time></div><p class="entry-message">{escape(entry['message'])}</p></div>
+    <form action="/entries/{entry_id}/delete" method="post" accept-charset="UTF-8"><label for="password">삭제 비밀번호</label>
+    <input id="password" name="password" type="password" minlength="4" maxlength="64" required autocomplete="off" autofocus>
+    <p class="hint">작성할 때 입력한 비밀번호를 입력하세요.</p><div class="actions"><a class="button secondary" href="/">취소</a>
+    <button class="button" type="submit">삭제</button></div></form></section>'''
+        return page_shell('글 삭제', body, notice, bool(notice))
+
+
+    class GuestbookHandler(BaseHTTPRequestHandler):
+        def setup(self):
+            super().setup()
+            self.connection.settimeout(8)
+
+        def respond(self, status, text='', content_type='text/html; charset=utf-8', location=None):
+            body = text.encode('utf-8')
+            self.send_response(status)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Referrer-Policy', 'same-origin')
+            self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+            if status == 429:
+                self.send_header('Retry-After', '60')
+            if location:
+                self.send_header('Location', location)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def problem(self, status, message):
+            body = f'<div class="error-page">{html.escape(message)}</div><div class="actions"><a class="button secondary" href="/">목록</a></div>'
+            self.respond(status, page_shell('안내', body))
+
+        def database_unavailable(self):
+            self.problem(503, '데이터베이스에 연결할 수 없습니다. 잠시 후 다시 시도해 주세요.')
+
+        def show_list(self):
+            params = parse_qs(urlsplit(self.path).query, max_num_fields=4)
+            try:
+                page = max(1, int(params.get('page', ['1'])[0]))
+            except (ValueError, TypeError):
+                page = 1
+            total = redis_commands(('LLEN', ENTRY_KEY))[0]
+            page = min(page, max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE))
+            start = (page - 1) * PAGE_SIZE
+            rows = redis_commands(('LRANGE', ENTRY_KEY, start, start + PAGE_SIZE - 1))[0]
+            notice = '등록되었습니다.' if params.get('saved') == ['1'] else '삭제되었습니다.' if params.get('deleted') == ['1'] else ''
+            self.respond(200, render_list([json.loads(row) for row in rows], total, page, notice))
+
+        def get_entry(self, entry_id):
+            raw = redis_commands(('HGET', INDEX_KEY, entry_id))[0]
+            if raw is None:
+                return None, None
+            entry = json.loads(raw)
+            if entry.get('id') != entry_id or not entry.get('password_hash'):
+                return None, None
+            return entry, raw
+
+        def do_GET(self):
+            path = urlsplit(self.path).path
+            if path == '/healthz':
+                self.respond(200, 'ok\n', 'text/plain; charset=utf-8')
+                return
+            if path == '/favicon.ico':
+                self.respond(204)
+                return
+            try:
+                if path == '/readyz':
+                    if redis_commands(('PING',))[0] != 'PONG':
+                        raise RedisError('Unexpected PING reply')
+                    self.respond(200, 'ready\n', 'text/plain; charset=utf-8')
+                elif path == '/':
+                    self.show_list()
+                elif path == '/write':
+                    self.respond(200, render_write())
+                else:
+                    match = re.fullmatch(r'/entries/([0-9a-f]{32})/delete', path)
+                    if not match:
+                        self.problem(404, '페이지를 찾을 수 없습니다.')
+                        return
+                    entry, _ = self.get_entry(match[1])
+                    if entry is None:
+                        self.problem(404, '글을 찾을 수 없습니다.')
+                        return
+                    self.respond(200, render_delete(entry))
+            except (OSError, RedisError, ValueError, KeyError, TypeError):
+                self.database_unavailable()
+
+        def read_form(self):
+            origin = self.headers.get('Origin')
+            if origin and urlsplit(origin).netloc != self.headers.get('Host'):
+                self.problem(403, '방명록 화면을 새로 열어 다시 시도해 주세요.')
+                return None
+            if self.headers.get('Content-Type', '').split(';', 1)[0].strip() != 'application/x-www-form-urlencoded':
+                self.problem(415, '지원하지 않는 입력 형식입니다.')
+                return None
+            try:
+                size = int(self.headers.get('Content-Length', '0'))
+                if size <= 0 or self.headers.get('Transfer-Encoding'):
+                    raise ValueError('Invalid length')
+                if size > 8192:
+                    self.problem(413, '입력한 내용이 너무 깁니다.')
+                    return None
+                body = self.rfile.read(size)
+                if len(body) != size:
+                    raise ValueError('Incomplete body')
+                return parse_qs(body.decode('utf-8'), keep_blank_values=True, max_num_fields=4)
+            except (ValueError, OSError):
+                self.problem(400, '입력 내용을 확인해 주세요.')
+                return None
+
+        def do_POST(self):
+            path = urlsplit(self.path).path
+            delete_match = re.fullmatch(r'/entries/([0-9a-f]{32})/delete', path)
+            if path != '/entries' and delete_match is None:
+                self.problem(404, '페이지를 찾을 수 없습니다.')
+                return
+            values = self.read_form()
+            if values is None:
+                return
+            password = values.get('password', [''])[0]
+            try:
+                if path == '/entries':
+                    name = values.get('name', [''])[0].strip()
+                    message = values.get('message', [''])[0].strip()
+                    if not 1 <= len(name) <= 30 or not 1 <= len(message) <= 500 or not 4 <= len(password) <= 64:
+                        self.respond(400, render_write('작성자는 1~30자, 내용은 1~500자, 비밀번호는 4~64자로 입력하세요.', name[:30], message[:500]))
+                        return
+                    if not HASH_SLOTS.acquire(blocking=False):
+                        self.problem(429, '요청이 많습니다. 잠시 후 다시 시도해 주세요.')
+                        return
+                    try:
+                        password_hash = encode_password(password)
+                    finally:
+                        HASH_SLOTS.release()
+                    entry_id = secrets.token_hex(16)
+                    entry = {'id': entry_id, 'name': name, 'message': message,
+                        'created_at': datetime.now(KST).strftime('%Y.%m.%d %H:%M:%S'), 'password_hash': password_hash}
+                    raw = json.dumps(entry, ensure_ascii=False, separators=(',', ':'))
+                    if redis_commands(('EVAL', CREATE_SCRIPT, 2, ENTRY_KEY, INDEX_KEY, entry_id, raw))[0] != 1:
+                        raise RedisError('Entry could not be created')
+                    self.respond(303, location='/?saved=1')
+                    return
+                entry_id = delete_match[1]
+                entry, raw = self.get_entry(entry_id)
+                if entry is None:
+                    self.problem(404, '글을 찾을 수 없습니다.')
+                    return
+                if not 4 <= len(password) <= 64:
+                    self.respond(400, render_delete(entry, '비밀번호는 4~64자로 입력하세요.'))
+                    return
+                attempt_key = 'guestbook:delete-attempts:' + entry_id
+                if redis_commands(('EVAL', ATTEMPT_SCRIPT, 1, attempt_key))[0] > 10:
+                    self.respond(429, render_delete(entry, '시도 횟수를 초과했습니다. 1분 후 다시 시도해 주세요.'))
+                    return
+                if not HASH_SLOTS.acquire(blocking=False):
+                    self.problem(429, '요청이 많습니다. 잠시 후 다시 시도해 주세요.')
+                    return
+                try:
+                    valid = verify_password(password, entry['password_hash'])
+                finally:
+                    HASH_SLOTS.release()
+                if not valid:
+                    self.respond(403, render_delete(entry, '비밀번호가 일치하지 않습니다.'))
+                    return
+                removed = redis_commands(('EVAL', DELETE_SCRIPT, 3, ENTRY_KEY, INDEX_KEY, attempt_key, entry_id, raw))[0]
+                if removed != 1:
+                    self.problem(404, '이미 삭제된 글입니다.')
+                    return
+                self.respond(303, location='/?deleted=1')
+            except (OSError, RedisError, ValueError, KeyError, TypeError):
+                self.database_unavailable()
+
+
+    if __name__ == '__main__':
+        print(f'Guestbook listening on port {PORT}', flush=True)
+        ThreadingHTTPServer(('0.0.0.0', PORT), GuestbookHandler).serve_forever()
