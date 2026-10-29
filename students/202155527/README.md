@@ -73,7 +73,7 @@ OpenShift에 로그인한 `oc` CLI 환경에서 실행합니다. 프로젝트에
 
 ```bash
 git clone https://github.com/kmj345/openshift-guestbook.git
-cd openshift-guestbook/students/20215527
+cd openshift-guestbook/students/202155527
 
 oc project OpenShift_프로젝트_이름
 oc apply -f k8s/
