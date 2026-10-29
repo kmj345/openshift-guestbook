@@ -82,7 +82,7 @@ oc rollout status deployment/guestbook-redis --timeout=300s
 oc rollout status deployment/guestbook-web --timeout=300s
 ```
 
-`k8s/`에는 위 Object에 해당하는 YAML 9개가 있습니다. 다른 환경에도 배포할 수 있도록 namespace, uid, resourceVersion, status, Route host 등 환경별 값과 자동 생성 항목을 제외했습니다. Secret에는 실습용 비밀번호가 포함되어 있습니다.
+`k8s/`에는 위 Object에 해당하는 YAML 9개가 있습니다. 다른 환경에도 배포할 수 있도록 namespace, uid, resourceVersion, status, Route host 등 환경별 값과 자동 생성 항목을 제외했습니다.
 
 ### 실행 확인
 
@@ -96,7 +96,7 @@ oc get route guestbook-web
 
 ### 전체 재배포 검증
 
-제출 YAML만으로 다시 배포할 수 있는지 확인하는 절차입니다. **PVC도 삭제하므로 기존 방명록 데이터가 삭제될 수 있습니다.**
+제출 YAML만으로 다시 배포할 수 있는지 확인하는 절차입니다. PVC도 삭제하므로 기존 방명록 데이터가 삭제될 수 있습니다.
 
 ```bash
 oc delete -f k8s/ --wait=true
@@ -121,7 +121,6 @@ oc rollout status deployment/guestbook-web --timeout=300s
 | Redis Pod 재생성 | 기존 글 유지 |
 | 전체 삭제 후 재배포 | YAML 9개로 재생성 및 방명록 기능 정상 동작 |
 
-데이터 보존은 확인용 글을 작성한 뒤 Redis Pod만 삭제해 검사했습니다. 새 Pod가 준비된 후 방명록을 새로고침했으며, 기존 글이 남아 있었습니다. 이때 PVC는 삭제하지 않았습니다.
 
 아래는 최초 배포와 데이터 보존 테스트 당시의 화면입니다.
 
